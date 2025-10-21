@@ -323,6 +323,59 @@
 
   <div id="toast" class="toast">保存しました</div>
 
+<!-- Firebase SDKs -->
+<script type="module">
+  // ============================================
+  // Firebase設定エリア
+  // ============================================
+  // TODO: Firebaseコンソールから取得した設定情報に置き換えてください
+  // https://console.firebase.google.com/ でプロジェクトを作成後、
+  // プロジェクト設定 > 全般 > マイアプリ から取得できます
+
+  const FIREBASE_CONFIG = {
+    apiKey: "YOUR_API_KEY_HERE",
+    authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
+    projectId: "YOUR_PROJECT_ID",
+    storageBucket: "YOUR_PROJECT_ID.appspot.com",
+    messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+    appId: "YOUR_APP_ID"
+  };
+
+  // Firebase有効化フラグ（設定情報を入力したらtrueに変更）
+  const FIREBASE_ENABLED = false;
+
+  // ============================================
+  // Firebase初期化とデータ同期
+  // ============================================
+  import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js';
+  import { getFirestore, doc, setDoc, getDoc, onSnapshot } from 'https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js';
+
+  let db = null;
+  let unsubscribe = null;
+
+  if (FIREBASE_ENABLED && FIREBASE_CONFIG.apiKey !== "YOUR_API_KEY_HERE") {
+    try {
+      const app = initializeApp(FIREBASE_CONFIG);
+      db = getFirestore(app);
+      console.log('✅ Firebase初期化成功');
+
+      // グローバルにFirebase機能とFirestore関数を公開
+      window.firebaseDB = db;
+      window.firebaseEnabled = true;
+      window.firestoreDoc = doc;
+      window.firestoreSetDoc = setDoc;
+      window.firestoreGetDoc = getDoc;
+      window.firestoreOnSnapshot = onSnapshot;
+    } catch (error) {
+      console.error('❌ Firebase初期化エラー:', error);
+      window.firebaseEnabled = false;
+    }
+  } else {
+    console.log('ℹ️ Firebaseは無効化されています（ローカルストレージのみ使用）');
+    window.firebaseEnabled = false;
+  }
+</script>
+
 <script>
 (function(){
   // ----- State -----
@@ -343,16 +396,35 @@
     { id: 5, client: '株式会社グローバル商事',  business: '1.設計',   project: 'ECサイト構築',   person: '山田様', sales: 450000, cost: 180000, month: '4月', year: '2025', status: '4.請求済み', isPaid: false },
   ];
 
-  // ---- Auto Save / Restore ----
+  // ---- Auto Save / Restore (Firebase + LocalStorage) ----
   const STORE_KEY = 'sd_store_v1';
   const DRAFT_KEY = 'sd_form_draft_v1';
-  function persist(){
+  const FIREBASE_DOC_ID = 'salesData'; // Firestoreのドキュメ ントID
+
+  let isSyncing = false; // 同期中フラグ（無限ループ防止）
+
+  async function persist(){
+    // ローカルストレージに保存
     try{
-      const payload = {version:1, salesData, annualTarget, selectedYear};
+      const payload = {version:1, salesData, annualTarget, selectedYear, lastUpdated: Date.now()};
       localStorage.setItem(STORE_KEY, JSON.stringify(payload));
     }catch(e){ console.warn('persist failed', e); }
+
+    // Firebaseに保存
+    if (window.firebaseEnabled && window.firebaseDB && !isSyncing) {
+      try{
+        const payload = {version:1, salesData, annualTarget, selectedYear, lastUpdated: Date.now()};
+        await window.firestoreSetDoc(window.firestoreDoc(window.firebaseDB, 'sales', FIREBASE_DOC_ID), payload);
+        console.log('☁️ Firebaseに同期しました');
+      }catch(e){
+        console.warn('Firebase sync failed', e);
+        showToast('同期エラー（ローカルには保存済み）');
+      }
+    }
   }
-  function restore(){
+
+  async function restore(){
+    // まずローカルストレージから復元
     try{
       const saved = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
       if (saved){
@@ -361,6 +433,58 @@
         if (typeof saved.selectedYear === 'string') selectedYear = saved.selectedYear;
       }
     }catch(e){ console.warn('restore failed', e); }
+
+    // Firebaseからデータを取得（リアルタイム同期開始）
+    if (window.firebaseEnabled && window.firebaseDB) {
+      try{
+        const docRef = window.firestoreDoc(window.firebaseDB, 'sales', FIREBASE_DOC_ID);
+
+        // 初回読み込み
+        const docSnap = await window.firestoreGetDoc(docRef);
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          const localData = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
+
+          // リモートの方が新しい場合のみ上書き
+          if (!localData || (data.lastUpdated > (localData.lastUpdated || 0))) {
+            isSyncing = true;
+            if (Array.isArray(data.salesData)) salesData = data.salesData;
+            if (typeof data.annualTarget === 'number') annualTarget = data.annualTarget;
+            if (typeof data.selectedYear === 'string') selectedYear = data.selectedYear;
+            localStorage.setItem(STORE_KEY, JSON.stringify(data));
+            renderAll();
+            showToast('☁️ クラウドからデータを復元しました');
+            isSyncing = false;
+          }
+        }
+
+        // リアルタイム同期を開始
+        window.firestoreOnSnapshot(docRef, (doc) => {
+          if (isSyncing) return; // 自分の更新は無視
+
+          if (doc.exists()) {
+            const data = doc.data();
+            const localData = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
+
+            // リモートの方が新しい場合のみ更新
+            if (!localData || (data.lastUpdated > (localData.lastUpdated || 0))) {
+              isSyncing = true;
+              if (Array.isArray(data.salesData)) salesData = data.salesData;
+              if (typeof data.annualTarget === 'number') annualTarget = data.annualTarget;
+              if (typeof data.selectedYear === 'string') selectedYear = data.selectedYear;
+              localStorage.setItem(STORE_KEY, JSON.stringify(data));
+              renderAll();
+              showToast('☁️ 他の端末から更新されました');
+              setTimeout(() => isSyncing = false, 500);
+            }
+          }
+        });
+
+        console.log('✅ Firebaseリアルタイム同期開始');
+      }catch(e){
+        console.warn('Firebase restore failed', e);
+      }
+    }
   }
   function persistDraft(){
     try{
